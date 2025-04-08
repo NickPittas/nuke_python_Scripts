@@ -1,0 +1,86 @@
+{
+  "templateName": "Demo Template",
+  "templateString": "<sequence><shotNumber>_<description>_<pixelMappingName><resolution>_<colorspace><gamma>_<fps>_<version>.<frame_padding>.<extension>",
+  "tags": {
+    "sequence": {
+      "label": "Sequence",
+      "default": "WTFB",
+      "allowed": ["WTFB", "KITC", "IGB", "LIFF", "SOME", "OLNT", "ATBM"],
+      "overrideAllowed": true,
+      "locked": false,
+      "note": "Sequence is chosen from the allowed list or overridden manually."
+    },
+    "shotNumber": {
+      "label": "Shot Number",
+      "default": "0010",
+      "increment": 10,
+      "overrideAllowed": true,
+      "locked": false,
+      "note": "4-digit shot number that increments by 10 if auto-increment is used."
+    },
+    "description": {
+      "label": "Description",
+      "default": "comp",
+      "allowed": ["comp", "roto", "paint", "previz", "concept", "layout", "dmp"],
+      "overrideAllowed": true,
+      "locked": false,
+      "note": "Description chosen from list or overridden (camelCase or underscores only)."
+    },
+    "pixelMappingName": {
+      "label": "Pixel Mapping Name",
+      "default": "LL180",
+      "allowed": ["LL180", "LL360"],
+      "overrideAllowed": true,
+      "locked": false,
+      "note": "Leave blank if not applicable."
+    },
+    "resolution": {
+      "label": "Resolution",
+      "default": "8K",
+      "allowed": ["hd", "2k", "4k", "8k", "12k", "16k", "32k"],
+      "overrideAllowed": true,
+      "locked": false
+    },
+    "colorspace": {
+      "label": "Colorspace",
+      "allowed": ["rec709", "sRGB", "acescg"],
+      "overrideAllowed": true,
+      "locked": false
+    },
+    "gamma": {
+      "label": "Gamma",
+      "allowed": ["lin", "g22", "g24"],
+      "overrideAllowed": true,
+      "locked": false
+    },
+    "fps": {
+      "label": "FPS",
+      "default": "2997",
+      "allowed": ["2398", "24", "25", "2997", "30", "5994"],
+      "overrideAllowed": true,
+      "locked": false
+    },
+    "frame_padding": {
+      "label": "Frame Padding",
+      "default": "8",
+      "overrideAllowed": true,
+      "locked": false,
+      "note": "Number of digits for frame numbering."
+    },
+    "extension": {
+      "label": "Extension",
+      "default": "exr",
+      "allowed": ["exr", "jpg", "png", "mov", "mp4"],
+      "overrideAllowed": true,
+      "locked": false
+    }
+  },
+  "proxyFull": {
+    "full": {
+      "pathSuffix": "full"
+    },
+    "proxy": {
+      "pathSuffix": "proxy"
+    }
+  }
+}

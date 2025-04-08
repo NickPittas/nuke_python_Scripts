@@ -1,0 +1,121 @@
+import nuke
+import nukescripts
+from PySide6 import QtWidgets, QtCore
+
+
+class ProxyPanel(QtWidgets.QWidget):
+    def __init__(self, parent=None):
+        super(ProxyPanel, self).__init__(parent)
+        self.setObjectName('com.example.ProxyPanel')
+        self.setWindowTitle('Proxy Panel')
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # Create widgets
+        self.proxy = QtWidgets.QCheckBox('Enable Proxy')
+        self.set_full_rez = QtWidgets.QPushButton('Set Full Res from Node')
+        self.full_rez = QtWidgets.QLineEdit('1920x1080')
+        self.set_proxy_rez = QtWidgets.QPushButton('Set Proxy Res from Node')
+        self.proxy_rez = QtWidgets.QLineEdit('960x540')
+        self.resize_x = QtWidgets.QLineEdit()
+        self.resize_x.setReadOnly(True)
+        self.create_transform = QtWidgets.QPushButton('Create Transform Node')
+
+        # Add widgets to layout
+        layout.addWidget(self.proxy)
+        layout.addWidget(QtWidgets.QLabel(''))  # Spacer
+        layout.addWidget(self.set_full_rez)
+        layout.addWidget(QtWidgets.QLabel('Full Resolution:'))
+        layout.addWidget(self.full_rez)
+        layout.addWidget(self.set_proxy_rez)
+        layout.addWidget(QtWidgets.QLabel('Proxy Resolution:'))
+        layout.addWidget(self.proxy_rez)
+        layout.addWidget(QtWidgets.QLabel(''))  # Spacer
+        layout.addWidget(QtWidgets.QLabel('Resize Ratio:'))
+        layout.addWidget(self.resize_x)
+        layout.addWidget(self.create_transform)
+
+        # Connect signals
+        self.proxy.stateChanged.connect(self.update_resize_ratio)
+        self.full_rez.textChanged.connect(self.update_resize_ratio)
+        self.proxy_rez.textChanged.connect(self.update_resize_ratio)
+        self.set_full_rez.clicked.connect(lambda: self.set_resolution_from_node(self.full_rez))
+        self.set_proxy_rez.clicked.connect(lambda: self.set_resolution_from_node(self.proxy_rez))
+        self.create_transform.clicked.connect(self.create_transform_node)
+
+        # Initial update of resize ratio
+        self.update_resize_ratio()
+
+    def update_resize_ratio(self):
+        try:
+            full_w, full_h = map(int, self.full_rez.text().split('x'))
+            proxy_w, proxy_h = map(int, self.proxy_rez.text().split('x'))
+            if proxy_w != 0 and proxy_h != 0:
+                ratio = full_w / proxy_w
+                if self.proxy.isChecked():
+                    ratio = 1 / ratio if ratio != 0 else 1
+                else:
+                    ratio = 1
+                self.resize_x.setText(f'{ratio:.4f}')
+            else:
+                self.resize_x.setText('1.0000')
+        except ValueError:
+            self.resize_x.setText('Invalid input')
+
+        # Update TCL variables
+        self.update_tcl_variables()
+
+    def update_tcl_variables(self):
+        nuke.tcl(f'set ::proxy_panel_proxy {int(self.proxy.isChecked())}')
+        full_w, full_h = map(int, self.full_rez.text().split('x'))
+        nuke.tcl(f'set ::proxy_panel_full_rez_width {full_w}')
+        nuke.tcl(f'set ::proxy_panel_full_rez_height {full_h}')
+        proxy_w, proxy_h = map(int, self.proxy_rez.text().split('x'))
+        nuke.tcl(f'set ::proxy_panel_proxy_rez_width {proxy_w}')
+        nuke.tcl(f'set ::proxy_panel_proxy_rez_height {proxy_h}')
+        nuke.tcl(f'set ::proxy_panel_resize_ratio {float(self.resize_x.text())}')
+
+    def set_resolution_from_node(self, target_line_edit):
+        try:
+            selected_node = nuke.selectedNode()
+            width = selected_node.width()
+            height = selected_node.height()
+            target_line_edit.setText(f'{width}x{height}')
+        except:
+            nuke.message("Please select a node first.")
+
+    def create_transform_node(self):
+        try:
+            selected_node = nuke.selectedNode()
+            transform = nuke.nodes.Transform()
+            transform.setInput(0, selected_node)
+            transform['center'].setValue([0, 0])
+            transform['scale'].setExpression('[expr $::proxy_panel_resize_ratio]')
+            nuke.message("Transform node created with dynamic scale")
+        except:
+            nuke.message("Please select a node first.")
+
+
+class ProxyPanelWrapper(nukescripts.PythonPanel):
+    def __init__(self):
+        super(ProxyPanelWrapper, self).__init__('Proxy Panel', 'com.example.ProxyPanel')
+        # Set the widget directly
+        self.setWidget(ProxyPanel())
+
+# Function to add the panel to the Pane menu
+def add_to_pane_menu():
+    nukescripts.registerPanel('com.example.ProxyPanel', ProxyPanelWrapper)
+
+# Function to show the floating Proxy Panel
+def show_proxy_panel():
+    panel = ProxyPanelWrapper()
+    panel.show()
+
+# Add the panel to the Nuke pane menu and the "Custom Tools" menu
+def add_to_menu():
+    add_to_pane_menu()  # Add to pane menu for docking
+    custom_menu = nuke.menu("Nuke").addMenu("Custom Tools")
+    custom_menu.addCommand("Show Proxy Panel", show_proxy_panel)
+
+# Add the menu item
+add_to_menu()

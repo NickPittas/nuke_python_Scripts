@@ -1,0 +1,18 @@
+{
+    "templateFile": "KC.json",
+    "baseDirectory": "V:\\KennyChesney_TheSphere_2025-02-06\\05_comp\\WTFB\\render",
+    "sequence": "WTFB",
+    "shotNumber": "0010",
+    "description": "comp",
+    "pixelMapping": "LL180",
+    "fullResolution": "12k",
+    "proxyResolution": "4k",
+    "colorspace": "sRGB",
+    "gamma": "g22",
+    "fps": "2997",
+    "version": "v001",
+    "framePadding": "4",
+    "extension": "jpg",
+    "autoIncrementShot": false,
+    "autoIncrementVersion": false
+}
