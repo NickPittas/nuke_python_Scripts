@@ -1,0 +1,373 @@
+// SphericalTransform BlinkScript
+// Handles conversions between 360° formats: LatLong and Rectilinear
+// Designed to match Nuke's built-in SphericalTransform node
+
+kernel SphericalTransform : ImageComputationKernel<ePixelWise>
+{
+  Image<eRead, eAccessRandom, eEdgeClamped> src; // Source image
+  Image<eWrite> dst; // Output image
+
+  // Parameters
+  param:
+    int srcFormat;      // Input format (0: LatLong, 1: Rectilinear)
+    int dstFormat;      // Destination format (0: LatLong, 1: Rectilinear)
+    float rotationX;    // X rotation (pitch) in degrees
+    float rotationY;    // Y rotation (yaw) in degrees
+    float rotationZ;    // Z rotation (roll) in degrees
+    float fov;          // Field of view (horizontal) for rectilinear in degrees
+    float outputCenterX; // Output center X offset in pixels
+    float outputCenterY; // Output center Y offset in pixels
+    bool is180;         // Whether input is 180 degrees LatLong (assumes front-facing)
+    bool forceProperRatio; // Force 2:1 aspect ratio for LatLong sampling/projection
+    int filterType;     // 0: Nearest, 1: Bilinear, 2: Bicubic
+    bool swapFormats;   // Swap input/output formats and invert rotation for inverse transform
+
+  // Define parameters with descriptive names and defaults
+  void define() {
+    defineParam(srcFormat, "Input Projection", 0);  // Default LatLong
+    defineParam(dstFormat, "Output Projection", 0); // Default LatLong
+    defineParam(rotationX, "Rotation X", 0.0f);
+    defineParam(rotationY, "Rotation Y", 0.0f);
+    defineParam(rotationZ, "Rotation Z", 0.0f);
+    defineParam(fov, "Field of View", 90.0f);
+    defineParam(outputCenterX, "Output Center X", 0.0f);
+    defineParam(outputCenterY, "Output Center Y", 0.0f);
+    defineParam(is180, "180 Degree Input", false);
+    defineParam(forceProperRatio, "Force 2:1 Ratio", true);
+    defineParam(filterType, "Filter", 2); // Default to Bicubic
+    defineParam(swapFormats, "Swap Formats", false);
+  }
+
+  // 3D Rotation matrix application using ZXY order (Nuke's convention)
+  // Rotates vector 'v' in place. Angles are in degrees.
+  void rotateVector(float3 &v, float rx_deg, float ry_deg, float rz_deg) {
+    // Convert degrees to radians (PI / 180 = 0.017453292519943f)
+    float rx = rx_deg * 0.017453292519943f;
+    float ry = ry_deg * 0.017453292519943f;
+    float rz = rz_deg * 0.017453292519943f;
+
+    // Z rotation
+    float cz = cos(rz);
+    float sz = sin(rz);
+    float tempX = v.x * cz - v.y * sz;
+    float tempY = v.x * sz + v.y * cz;
+    v.x = tempX;
+    v.y = tempY;
+
+    // X rotation
+    float cx = cos(rx);
+    float sx = sin(rx);
+    tempY = v.y * cx - v.z * sx;
+    float tempZ = v.y * sx + v.z * cx;
+    v.y = tempY;
+    v.z = tempZ;
+
+    // Y rotation
+    float cy = cos(ry);
+    float sy = sin(ry);
+    tempX = v.x * cy + v.z * sy;
+    tempZ = -v.x * sy + v.z * cy;
+    v.x = tempX;
+    v.z = tempZ;
+  }
+
+  // Convert 3D cartesian direction vector to Lat-Long UV coordinates [0, 1]
+  // Returns (-1, -1) if mapping is invalid (e.g., behind for 180).
+  float2 cartesianToLatLong(float3 dir) {
+    // Normalize just in case
+    float len = sqrt(dir.x*dir.x + dir.y*dir.y + dir.z*dir.z);
+    if (len < 1e-6f) return float2(-1.0f, -1.0f);
+    dir /= len;
+
+    // Latitude: angle from equator [-PI/2, PI/2] (1.570796... = PI/2)
+    float lat = asin(clamp(dir.y, -1.0f, 1.0f));
+    // Longitude: angle in XZ plane from +Z [-PI, PI] (3.141592... = PI)
+    float lon = atan2(dir.x, dir.z);
+
+    // Map longitude [-PI, PI] to u [0, 1] (6.283185... = 2*PI)
+    float u = (lon + 3.141592653589793f) / 6.283185307179586f;
+    // Map latitude [-PI/2, PI/2] to v [0, 1] (v=0 at top/North Pole)
+    float v = 1.0f - (lat + 1.570796326794897f) / 3.141592653589793f;
+
+    // Handle 180 degree input case (only front hemisphere)
+    if (is180) {
+      if (dir.z < 0.0f) {
+        return float2(-1.0f, -1.0f); // Outside 180 degree FOV
+      }
+      // Front hemisphere u is [0.25, 0.75], remap to [0, 1]
+      u = (u - 0.25f) * 2.0f;
+      // Check validity (allow for small float errors)
+      if (u < -1e-6f || u > 1.0f + 1e-6f) {
+         return float2(-1.0f, -1.0f);
+      }
+      u = clamp(u, 0.0f, 1.0f); // Clamp strictly
+    }
+
+    return float2(u, v);
+  }
+
+  // Convert Lat-Long UV coordinates [0, 1] to 3D cartesian direction vector
+  float3 latLongToCartesian(float2 uv) {
+    float u = uv.x;
+    float v = uv.y;
+
+    // Handle 180 degree: map u [0, 1] back to front hemisphere [0.25, 0.75]
+    if (is180) {
+      u = u * 0.5f + 0.25f;
+    }
+
+    // Map u [0, 1] back to longitude [-PI, PI] (6.283... = 2*PI, 3.141... = PI)
+    float lon = u * 6.283185307179586f - 3.141592653589793f;
+    // Map v [0, 1] back to latitude [-PI/2, PI/2] (1.570... = PI/2)
+    float lat = (1.0f - v) * 3.141592653589793f - 1.570796326794897f;
+
+    // Convert spherical coordinates (lat, lon) to 3D vector
+    float cosLat = cos(lat);
+    float3 dir;
+    dir.x = cosLat * sin(lon);
+    dir.y = sin(lat);
+    dir.z = cosLat * cos(lon);
+
+    return dir; // Already normalized
+  }
+
+  // Convert 3D cartesian direction vector to Rectilinear UV coordinates [0, 1]
+  // fov_deg is horizontal field of view in degrees.
+  // Returns (-1, -1) if direction is behind the view (z <= 0).
+  float2 cartesianToRectilinear(float3 dir, float fov_deg) {
+    if (dir.z <= 1e-6f) {
+      return float2(-1.0f, -1.0f); // Cannot project points behind or exactly at side
+    }
+
+    // Tangent of half the horizontal FOV angle (0.01745... = DEG_TO_RAD)
+    float tanHalfFOV = tan(fov_deg * 0.5f * 0.017453292519943f);
+
+    if (fabs(tanHalfFOV) < 1e-6f) { // Handle zero FOV case
+        if (fabs(dir.x) < 1e-6f && fabs(dir.y) < 1e-6f && dir.z > 0.0f) {
+            return float2(0.5f, 0.5f); // Only forward vector maps to center
+        } else {
+            return float2(-1.0f, -1.0f);
+        }
+    }
+
+    // Project onto the image plane at z=1
+    float projX = dir.x / dir.z;
+    float projY = dir.y / dir.z;
+
+    // Map projected coords to UV [0, 1]
+    float u = 0.5f + 0.5f * (projX / tanHalfFOV);
+    float v = 0.5f - 0.5f * (projY / tanHalfFOV); // Flip Y for image coords
+
+    // Return UV, boundary check happens later
+    return float2(u, v);
+  }
+
+  // Convert Rectilinear UV coordinates [0, 1] to 3D cartesian direction vector
+  // fov_deg is horizontal field of view in degrees.
+  float3 rectilinearToCartesian(float2 uv, float fov_deg) {
+    // Tangent of half the horizontal FOV angle (0.01745... = DEG_TO_RAD)
+    float tanHalfFOV = tan(fov_deg * 0.5f * 0.017453292519943f);
+
+    // Convert UV [0, 1] to projection plane coordinates
+    float projX = (uv.x - 0.5f) * 2.0f * tanHalfFOV;
+    float projY = -(uv.y - 0.5f) * 2.0f * tanHalfFOV; // Flip Y back from image coords
+
+    // Create 3D direction vector (points from origin through projection plane point)
+    float3 dir = float3(projX, projY, 1.0f);
+
+    // Normalize
+    float len = sqrt(dir.x*dir.x + dir.y*dir.y + dir.z*dir.z);
+    if (len < 1e-6f) return float3(0.0f, 0.0f, 1.0f); // Avoid div by zero, return forward
+    dir /= len;
+
+    return dir;
+  }
+
+  // Bicubic weight function (Catmull-Rom variant, a = -0.5)
+  float bicubicWeight(float x) {
+    const float a = -0.5f;
+    x = fabs(x);
+    if (x < 1.0f) {
+      return (a + 2.0f) * x*x*x - (a + 3.0f) * x*x + 1.0f;
+    } else if (x < 2.0f) {
+      return a*x*x*x - 5.0f*a*x*x + 8.0f*a*x - 4.0f*a;
+    }
+    return 0.0f;
+  }
+
+
+  // Main process function, executed for each pixel in the output image
+  void process(int2 pos) {
+    // --- 1. Get Dimensions ---
+    int inputWidth = src.bounds.x2 - src.bounds.x1;
+    int inputHeight = src.bounds.y2 - src.bounds.y1;
+    int outputWidth = dst.bounds.x2 - dst.bounds.x1;
+    int outputHeight = dst.bounds.y2 - dst.bounds.y1;
+
+    if (inputWidth <= 0 || inputHeight <= 0 || outputWidth <= 0 || outputHeight <= 0) {
+        dst() = float4(0.0f); // Handle invalid input/output dimensions
+        return;
+    }
+
+    // --- 2. Determine Effective Formats and Rotations ---
+    int effectiveSrcFormat = srcFormat;
+    int effectiveDstFormat = dstFormat;
+    float effectiveRotationX = rotationX; // Start with user-provided values
+    float effectiveRotationY = rotationY;
+    float effectiveRotationZ = rotationZ;
+
+    if (swapFormats) {
+      // Swap effective format types
+      effectiveSrcFormat = 1 - srcFormat; // 0->1, 1->0
+      effectiveDstFormat = 1 - dstFormat; // 0->1, 1->0
+      // Invert the sense of rotation for inverse transform
+      effectiveRotationX = -rotationX;
+      effectiveRotationY = -rotationY;
+      effectiveRotationZ = -rotationZ;
+    }
+
+    // --- 3. Calculate Virtual Dimensions for UV mapping/sampling ---
+    // Output UV normalization dimensions (considers output format ratio)
+    float outUvWidth = float(outputWidth);
+    float outUvHeight = float(outputHeight);
+    if (forceProperRatio && effectiveDstFormat == 0 /*LatLong Output*/) {
+      if (outputWidth != outputHeight * 2) {
+         outUvWidth = outUvHeight * 2.0f; // Normalize UVs based on virtual 2:1 width
+      }
+    }
+    // Input sampling dimensions (considers input format ratio)
+    float sampleWidth = float(inputWidth);
+    float sampleHeight = float(inputHeight);
+    if (forceProperRatio && effectiveSrcFormat == 0 /*LatLong Input*/) {
+       if (inputWidth != inputHeight * 2) {
+          sampleWidth = sampleHeight * 2.0f; // Sample based on virtual 2:1 width
+       }
+    }
+
+    // --- 4. Destination Pixel to UV ---
+    // Calculate UV coordinate for the center of the current output pixel 'pos'
+    float2 uv;
+    uv.x = (float(pos.x) + 0.5f) / outUvWidth;
+    uv.y = (float(pos.y) + 0.5f) / outUvHeight;
+    // Apply output center offset (relative to output UV dimensions)
+    uv.x -= outputCenterX / outUvWidth;
+    uv.y -= outputCenterY / outUvHeight;
+
+    // --- 5. Destination UV to 3D Direction ---
+    // Convert the output UV coordinate to a 3D viewing direction based on the *effective* output format
+    float3 dir;
+    if (effectiveDstFormat == 0) { // Output is effectively LatLong
+      dir = latLongToCartesian(uv);
+    } else { // Output is effectively Rectilinear
+      dir = rectilinearToCartesian(uv, fov);
+    }
+
+    // --- 6. Apply Inverse of the *Effective* Rotation ---
+    // Rotate the viewing direction backwards using the inverse of the *effective* rotation
+    // This finds where the ray originated in the un-rotated source space.
+    rotateVector(dir, -effectiveRotationX, -effectiveRotationY, -effectiveRotationZ);
+
+    // --- 7. 3D Direction to Source UV ---
+    // Convert the rotated 3D direction into a UV coordinate in the *effective* source format
+    float2 srcUV;
+    if (effectiveSrcFormat == 0) { // Source is effectively LatLong
+      srcUV = cartesianToLatLong(dir);
+    } else { // Source is effectively Rectilinear
+      srcUV = cartesianToRectilinear(dir, fov);
+    }
+
+    // --- 8. Check Validity and Sample Source ---
+    // Check if the resulting source UV is valid (within [0,1] and not marked invalid by helpers)
+    bool validCoord = !(srcUV.x < -1e-6f || srcUV.x > 1.0f + 1e-6f || srcUV.y < -1e-6f || srcUV.y > 1.0f + 1e-6f);
+    // Clamp valid coordinates strictly to [0, 1] before using them for calculation
+    if (validCoord) {
+        srcUV.x = clamp(srcUV.x, 0.0f, 1.0f);
+        srcUV.y = clamp(srcUV.y, 0.0f, 1.0f);
+    }
+
+
+    if (validCoord) {
+      // Convert valid source UV [0,1] to source pixel coordinates using *virtual sampling dimensions*
+      float srcPixelX = srcUV.x * sampleWidth;
+      float srcPixelY = srcUV.y * sampleHeight;
+
+      // Sample the source image using the chosen filter type
+      if (filterType == 0) { // Nearest Neighbor
+        // Find nearest pixel integer coordinates
+        int sx = int(floor(srcPixelX));
+        int sy = int(floor(srcPixelY));
+        // Clamp to *actual* input image bounds before sampling
+        sx = clamp(sx, 0, inputWidth - 1);
+        sy = clamp(sy, 0, inputHeight - 1);
+        dst() = src(sx, sy);
+
+      } else if (filterType == 1) { // Bilinear
+        // Pixel coordinates for interpolation (pixel center is at integer + 0.5)
+        float fx = srcPixelX - 0.5f;
+        float fy = srcPixelY - 0.5f;
+        int x0 = int(floor(fx));
+        int y0 = int(floor(fy));
+        // Weights for interpolation
+        float wx1 = fx - x0;
+        float wy1 = fy - y0;
+        float wx0 = 1.0f - wx1;
+        float wy0 = 1.0f - wy1;
+        // Get neighboring pixel coordinates, clamping to *actual* input bounds
+        int sx0 = clamp(x0,   0, inputWidth - 1);
+        int sy0 = clamp(y0,   0, inputHeight - 1);
+        int sx1 = clamp(x0+1, 0, inputWidth - 1);
+        int sy1 = clamp(y0+1, 0, inputHeight - 1);
+        // Sample four neighbours and interpolate
+        dst() = wx0 * wy0 * src(sx0, sy0) +
+                wx1 * wy0 * src(sx1, sy0) +
+                wx0 * wy1 * src(sx0, sy1) +
+                wx1 * wy1 * src(sx1, sy1);
+
+      } else { // Bicubic (filterType == 2 or fallback)
+        // Pixel coordinates for interpolation
+        float fx = srcPixelX - 0.5f;
+        float fy = srcPixelY - 0.5f;
+        int x_base = int(floor(fx)); // Base integer coord
+        int y_base = int(floor(fy));
+        float dx = fx - x_base; // Fractional part
+        float dy = fy - y_base;
+
+        float4 result = float4(0.0f);
+        float weightSum = 0.0f;
+
+        // Iterate over 4x4 neighborhood
+        for (int j = -1; j <= 2; j++) {
+          for (int i = -1; i <= 2; i++) {
+            // Calculate sample coordinates, clamping to *actual* input bounds
+            int sx = clamp(x_base + i, 0, inputWidth - 1);
+            int sy = clamp(y_base + j, 0, inputHeight - 1);
+            // Calculate weight and accumulate result
+            float weight = bicubicWeight(i - dx) * bicubicWeight(j - dy);
+            result += weight * src(sx, sy);
+            weightSum += weight;
+          }
+        }
+
+        // Normalize result (avoid division by zero)
+        if (weightSum > 1e-6f) {
+          dst() = result / weightSum;
+        } else {
+           // Fallback if weights sum to zero: bilinear interpolate the central 4 pixels
+           int sx0 = clamp(x_base,   0, inputWidth - 1);
+           int sy0 = clamp(y_base,   0, inputHeight - 1);
+           int sx1 = clamp(x_base+1, 0, inputWidth - 1);
+           int sy1 = clamp(y_base+1, 0, inputHeight - 1);
+           float wx1 = dx; float wy1 = dy; // Use fractional parts as weights
+           float wx0 = 1.0f - wx1; float wy0 = 1.0f - wy1;
+           dst() = wx0 * wy0 * src(sx0, sy0) +
+                   wx1 * wy0 * src(sx1, sy0) +
+                   wx0 * wy1 * src(sx0, sy1) +
+                   wx1 * wy1 * src(sx1, sy1);
+        }
+      }
+    } else {
+      // Source coordinate is outside the valid range (e.g., view points outside source map)
+      dst() = float4(0.0f, 0.0f, 0.0f, 0.0f); // Output black
+    }
+  }
+};

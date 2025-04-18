@@ -1,0 +1,283 @@
+// SphericalTransform BlinkScript
+// Handles conversions between different 360° formats and rotation in spherical space
+
+kernel SphericalTransform : ImageComputationKernel<ePixelWise>
+{
+  Image<eRead, eAccessRandom, eEdgeClamped> src; // Source image
+  Image<eWrite> dst; // Output image
+
+  // Parameters for transformation type
+  param:
+    int srcFormat;  // 0: Lat-Long (equirectangular), 1: Rectilinear, 2: Fisheye
+    int dstFormat;  // 0: Lat-Long (equirectangular), 1: Rectilinear, 2: Fisheye
+    
+    // Rotation parameters (in degrees)
+    float rotationX; // Pitch
+    float rotationY; // Yaw
+    float rotationZ; // Roll
+    
+    // Field of view for rectilinear (in degrees)
+    float fov;
+    
+    // Coverage for fisheye (in degrees, typically 180 or 360)
+    float coverage;
+    
+    // Output center shift
+    float outputCenterX;
+    float outputCenterY;
+    
+    // Whether input is full 360 or 180
+    bool is180;
+
+  // Define parameters
+  void define() {
+    defineParam(srcFormat, "Source Format", 0);
+    defineParam(dstFormat, "Destination Format", 0);
+    defineParam(rotationX, "Rotation X", 0.0f);
+    defineParam(rotationY, "Rotation Y", 0.0f);
+    defineParam(rotationZ, "Rotation Z", 0.0f);
+    defineParam(fov, "Field of View", 90.0f);
+    defineParam(coverage, "Fisheye Coverage", 180.0f);
+    defineParam(outputCenterX, "Output Center X", 0.0f);
+    defineParam(outputCenterY, "Output Center Y", 0.0f);
+    defineParam(is180, "180 Degree Input", false);
+  }
+
+  // 3D Rotation matrix application
+  void rotateVector(float3 &v, float pitch, float yaw, float roll) {
+    // Convert degrees to radians
+    float pitchRad = pitch * 0.01745329251f; // PI/180
+    float yawRad = yaw * 0.01745329251f;
+    float rollRad = roll * 0.01745329251f;
+    
+    // Pre-calculate sine and cosine values
+    float cp = cos(pitchRad);
+    float sp = sin(pitchRad);
+    float cy = cos(yawRad);
+    float sy = sin(yawRad);
+    float cr = cos(rollRad);
+    float sr = sin(rollRad);
+    
+    // Create rotation matrix components
+    float m00 = cy * cr;
+    float m01 = cy * sr;
+    float m02 = -sy;
+    
+    float m10 = sp * sy * cr - cp * sr;
+    float m11 = sp * sy * sr + cp * cr;
+    float m12 = sp * cy;
+    
+    float m20 = cp * sy * cr + sp * sr;
+    float m21 = cp * sy * sr - sp * cr;
+    float m22 = cp * cy;
+    
+    // Apply rotation matrix by components
+    float x = m00 * v.x + m01 * v.y + m02 * v.z;
+    float y = m10 * v.x + m11 * v.y + m12 * v.z;
+    float z = m20 * v.x + m21 * v.y + m22 * v.z;
+    
+    v.x = x;
+    v.y = y;
+    v.z = z;
+  }
+
+  // Convert Cartesian coordinates to Latitude-Longitude (equirectangular)
+  float2 cartesianToLatLong(float3 dir) {
+    float lat = asin(dir.y);
+    float lon = atan2(dir.x, dir.z);
+    
+    // Convert to UV coordinates (0-1 range)
+    float u = (lon + 3.14159265359f) / 6.28318530718f;
+    float v = (1.57079632679f - lat) / 3.14159265359f;
+    
+    if (is180) {
+      // For 180 footage, remap U to only use half the space
+      u = u * 0.5f + 0.25f;
+    }
+    
+    return float2(u, v);
+  }
+
+  // Convert Latitude-Longitude (equirectangular) to Cartesian coordinates
+  float3 latLongToCartesian(float u, float v) {
+    if (is180) {
+      // For 180 footage, remap U from half-space to full-space
+      u = (u - 0.25f) * 2.0f;
+    }
+    
+    // Convert from UV coordinates to spherical coordinates
+    float lon = u * 6.28318530718f - 3.14159265359f;
+    float lat = 1.57079632679f - v * 3.14159265359f;
+    
+    // Convert from spherical to Cartesian
+    float3 dir;
+    dir.x = sin(lon) * cos(lat);
+    dir.y = sin(lat);
+    dir.z = cos(lon) * cos(lat);
+    
+    return dir;
+  }
+
+  // Convert Cartesian coordinates to Rectilinear projection
+  float2 cartesianToRectilinear(float3 dir, float fieldOfView) {
+    // Check if the direction is pointing to the front hemisphere
+    if (dir.z <= 0) {
+      return float2(-1, -1); // Outside of view
+    }
+    
+    // Calculate FOV scale
+    float fovScale = tan(fieldOfView * 0.5f * 0.01745329251f);
+    
+    // Project to plane
+    float u = (dir.x / dir.z) * fovScale * 0.5f + 0.5f;
+    float v = (dir.y / dir.z) * fovScale * 0.5f + 0.5f;
+    
+    return float2(u, v);
+  }
+
+  // Convert Rectilinear coordinates to Cartesian
+  float3 rectilinearToCartesian(float u, float v, float fieldOfView) {
+    // Calculate FOV scale
+    float fovScale = tan(fieldOfView * 0.5f * 0.01745329251f);
+    
+    // Convert from UV to normalized device coordinates (-1 to 1)
+    float ndcX = (u - 0.5f) * 2.0f * fovScale;
+    float ndcY = (v - 0.5f) * 2.0f * fovScale;
+    
+    // Create direction vector
+    float3 dir;
+    dir.x = ndcX;
+    dir.y = ndcY;
+    dir.z = 1.0f;
+    
+    // Normalize the vector
+    float length = sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+    dir.x /= length;
+    dir.y /= length;
+    dir.z /= length;
+    
+    return dir;
+  }
+
+  // Convert Cartesian coordinates to Fisheye projection
+  float2 cartesianToFisheye(float3 dir, float fisheyeCoverage) {
+    // Calculate the angle from the viewing direction (z-axis)
+    float theta = acos(dir.z);
+    float phi = atan2(dir.y, dir.x);
+    
+    // Map to UV based on the fisheye coverage
+    float r = theta / (fisheyeCoverage * 0.5f * 0.01745329251f);
+    
+    // If out of the fisheye coverage, return invalid coordinates
+    if (r > 1.0f) {
+      return float2(-1, -1);
+    }
+    
+    // Convert to UV coordinates (0-1 range)
+    float u = r * cos(phi) * 0.5f + 0.5f;
+    float v = r * sin(phi) * 0.5f + 0.5f;
+    
+    return float2(u, v);
+  }
+
+  // Convert Fisheye coordinates to Cartesian
+  float3 fisheyeToCartesian(float u, float v, float fisheyeCoverage) {
+    // Convert from UV to normalized device coordinates (-1 to 1)
+    float ndcX = (u - 0.5f) * 2.0f;
+    float ndcY = (v - 0.5f) * 2.0f;
+    
+    // Calculate polar coordinates
+    float r = sqrt(ndcX * ndcX + ndcY * ndcY);
+    if (r > 1.0f) {
+      // Outside the fisheye circle
+      return float3(0, 0, 0);
+    }
+    
+    float phi = atan2(ndcY, ndcX);
+    float theta = r * (fisheyeCoverage * 0.5f * 0.01745329251f);
+    
+    // Convert to Cartesian coordinates
+    float3 dir;
+    dir.x = sin(theta) * cos(phi);
+    dir.y = sin(theta) * sin(phi);
+    dir.z = cos(theta);
+    
+    return dir;
+  }
+
+  // Main process function
+  void process(int2 pos) {
+    // Get current pixel position relative to image dimensions
+    float u = float(pos.x) / src.bounds.width();
+    float v = float(pos.y) / src.bounds.height();
+    
+    // Apply output center shift
+    u = u - outputCenterX / src.bounds.width();
+    v = v - outputCenterY / src.bounds.height();
+    
+    // Convert output coordinates to 3D direction based on destination format
+    float3 dir;
+    bool validCoord = true;
+    
+    if (dstFormat == 0) {
+      // Lat-Long (equirectangular) output
+      dir = latLongToCartesian(u, v);
+    } 
+    else if (dstFormat == 1) {
+      // Rectilinear output
+      dir = rectilinearToCartesian(u, v, fov);
+    } 
+    else if (dstFormat == 2) {
+      // Fisheye output
+      dir = fisheyeToCartesian(u, v, coverage);
+      if (dir.x == 0 && dir.y == 0 && dir.z == 0) {
+        validCoord = false;
+      }
+    }
+    
+    // Apply rotation in 3D space (inverse rotation for mapping)
+    rotateVector(dir, -rotationX, -rotationY, -rotationZ);
+    
+    // Convert 3D direction to input coordinates based on source format
+    float2 srcCoord;
+    
+    if (srcFormat == 0) {
+      // Lat-Long (equirectangular) input
+      srcCoord = cartesianToLatLong(dir);
+    } 
+    else if (srcFormat == 1) {
+      // Rectilinear input
+      srcCoord = cartesianToRectilinear(dir, fov);
+      if (srcCoord.x < 0 || srcCoord.y < 0 || srcCoord.x > 1 || srcCoord.y > 1) {
+        validCoord = false;
+      }
+    } 
+    else if (srcFormat == 2) {
+      // Fisheye input
+      srcCoord = cartesianToFisheye(dir, coverage);
+      if (srcCoord.x < 0 || srcCoord.y < 0 || srcCoord.x > 1 || srcCoord.y > 1) {
+        validCoord = false;
+      }
+    }
+    
+    // Sample the source image with calculated coordinates
+    if (validCoord) {
+      // Convert to pixel coordinates
+      int2 srcPixel;
+      srcPixel.x = int(srcCoord.x * src.bounds.width());
+      srcPixel.y = int(srcCoord.y * src.bounds.height());
+      
+      // Ensure coordinates are within bounds
+      srcPixel.x = clamp(srcPixel.x, 0, src.bounds.width() - 1);
+      srcPixel.y = clamp(srcPixel.y, 0, src.bounds.height() - 1);
+      
+      // Sample source image
+      float4 color = src(srcPixel.x, srcPixel.y);
+      dst() = color;
+    } 
+    else {
+      // Outside the valid range
+      dst() = float4(0, 0, 0, 0);
+    }
+  }
+};
